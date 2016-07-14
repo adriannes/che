@@ -22,20 +22,22 @@ import org.eclipse.che.api.core.model.machine.MachineConfig;
 import org.eclipse.che.api.core.model.machine.MachineLogMessage;
 import org.eclipse.che.api.core.model.machine.MachineStatus;
 import org.eclipse.che.api.core.model.workspace.Environment;
+import org.eclipse.che.api.core.util.AbstractLineConsumer;
 import org.eclipse.che.api.core.util.LineConsumer;
 import org.eclipse.che.api.core.util.MessageConsumer;
-import org.eclipse.che.api.core.util.WebsocketMessageConsumer;
 import org.eclipse.che.api.environment.server.EnvironmentStartException;
 import org.eclipse.che.api.environment.server.spi.EnvironmentEngine;
 import org.eclipse.che.api.machine.server.MachineManager;
 import org.eclipse.che.api.machine.server.exception.MachineException;
 import org.eclipse.che.api.machine.server.model.impl.MachineConfigImpl;
 import org.eclipse.che.api.machine.server.model.impl.MachineImpl;
+import org.eclipse.che.api.machine.server.model.impl.MachineLogMessageImpl;
 import org.eclipse.che.api.workspace.server.StrippedLocks;
 import org.slf4j.Logger;
 
 import javax.annotation.PreDestroy;
 import javax.inject.Inject;
+import java.io.IOException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -62,11 +64,7 @@ public class CheEnvironmentEngine implements EnvironmentEngine {
     private static final Logger LOG              = getLogger(CheEnvironmentEngine.class);
     public static final  String ENVIRONMENT_TYPE = "che";
 
-    // todo move to holder
-//    private final Map<String, Queue<MachineConfigImpl>> startQueues;
     private final MachineManager                 machineManager;
-    // todo move to holder
-//    private final Map<String, List<MachineImpl>>        machines;
     private final Map<String, EnvironmentHolder> environments;
     private final StrippedLocks                  strippedLocks;
 
@@ -76,8 +74,6 @@ public class CheEnvironmentEngine implements EnvironmentEngine {
     public CheEnvironmentEngine(MachineManager machineManager,
                                 CheEnvironmentValidator cheEnvironmentValidator) {
         this.machineManager = machineManager;
-//        this.startQueues = new HashMap<>();
-//        this.machines = new HashMap<>();
         this.environments = new HashMap<>();
         // 16 - experimental value for stripes count, it comes from default hash map size
         this.strippedLocks = new StrippedLocks(16);
@@ -92,7 +88,8 @@ public class CheEnvironmentEngine implements EnvironmentEngine {
     public List<Machine> start(String workspaceId,
                                Environment env,
                                boolean recover,
-                               MessageConsumer<MachineLogMessage> messageConsumer) throws EnvironmentStartException {
+                               MessageConsumer<MachineLogMessage> messageConsumer) throws EnvironmentStartException,
+                                                                                          ServerException {
         // Create a new start queue with a dev machine in the queue head
         List<MachineConfigImpl> startConfigs = env.getMachineConfigs()
                                                   .stream()
@@ -111,7 +108,7 @@ public class CheEnvironmentEngine implements EnvironmentEngine {
             environments.put(workspaceId, environmentHolder);
         }
 
-        startQueue(workspaceId, recover);
+        startQueue(workspaceId, env.getName(), recover, messageConsumer);
 
         List<MachineImpl> machines;
         try (StrippedLocks.ReadLock lock = strippedLocks.acquireReadLock(workspaceId)) {
@@ -121,7 +118,7 @@ public class CheEnvironmentEngine implements EnvironmentEngine {
     }
 
     @Override
-    public void stop(String workspaceId) throws ServerException {
+    public void stop(String workspaceId) throws ServerException, NotFoundException {
         // At this point of time starting queue must be removed
         // to prevent start of another machines which are not started yet.
         // In this case workspace start will be interrupted and
@@ -143,14 +140,16 @@ public class CheEnvironmentEngine implements EnvironmentEngine {
     }
 
     private void startQueue(String workspaceId,
-                            boolean recover) throws ServerException,
-                                                    NotFoundException,
-                                                    ConflictException {
+                            String envName,
+                            boolean recover,
+                            MessageConsumer<MachineLogMessage> messageConsumer) throws EnvironmentStartException,
+                                                                                       ServerException {
         // Starting all the machines one by one by getting configs
         // from the corresponding starting queue.
         // Config will be null only if there are no machines left in the queue
         MachineConfigImpl config = queuePeekOrFail(workspaceId);
         while (config != null) {
+            // todo should we support stop of env on dev machine failure on that level?
             // According to WorkspaceStatus specification the workspace start
             // is failed when dev-machine start is failed, so if any error
             // occurs during machine creation and the machine is dev-machine
@@ -158,7 +157,11 @@ public class CheEnvironmentEngine implements EnvironmentEngine {
             // and descriptor must be cleaned up
             MachineImpl machine = null;
             try {
-                machine = startMachine(config, workspaceId, envName, recover);
+                machine = startMachine(config,
+                                       workspaceId,
+                                       envName,
+                                       recover,
+                                       messageConsumer);
             } catch (RuntimeException | ServerException | ConflictException | NotFoundException x) {
                 if (config.isDev()) {
                     cleanupStartResources(workspaceId);
@@ -179,13 +182,13 @@ public class CheEnvironmentEngine implements EnvironmentEngine {
             boolean queuePolled = false;
             try (StrippedLocks.WriteLock lock = strippedLocks.acquireWriteLock(workspaceId)) {
                 ensurePreDestroyIsNotExecuted();
-                final Queue<MachineConfigImpl> queue = startQueues.get(workspaceId);
+                EnvironmentHolder environmentHolder = environments.get(workspaceId);
+                final Queue<MachineConfigImpl> queue = environmentHolder.startQueue;
                 if (queue != null) {
                     queue.poll();
                     queuePolled = true;
                     if (machine != null) {
-                        List<MachineImpl> machines = this.machines.get(workspaceId);
-                        machines.add(machine);
+                        environmentHolder.machines.add(machine);
                     }
                 }
             }
@@ -197,8 +200,9 @@ public class CheEnvironmentEngine implements EnvironmentEngine {
                 if (machine != null) {
                     machineManager.destroy(machine.getId(), false);
                 }
-                throw new ConflictException(format("Workspace '%s' start interrupted. Workspace stopped before all its machines started",
-                                                   workspaceId));
+                throw new EnvironmentStartException(
+                        format("Workspace '%s' start interrupted. Workspace stopped before all its machines started",
+                               workspaceId));
             }
 
             config = queuePeekOrFail(workspaceId);
@@ -209,13 +213,14 @@ public class CheEnvironmentEngine implements EnvironmentEngine {
         // some unlucky timing, the workspace may be stopped and started again
         // so the queue, which is guarded by the same lock as workspace descriptor
         // may be initialized again with a new batch of machines to start,
-        // that's why queue should be removed only if it is not empty.
+        // that's why queue should be removed only if it is empty.
         // On the other hand queue may not exist because workspace has been stopped
         // just before queue utilization, which considered as a normal behaviour
         try (StrippedLocks.WriteLock lock = strippedLocks.acquireWriteLock(workspaceId)) {
-            final Queue<MachineConfigImpl> queue = startQueues.get(workspaceId);
+            EnvironmentHolder environmentHolder = environments.get(workspaceId);
+            final Queue<MachineConfigImpl> queue = environmentHolder.startQueue;
             if (queue != null && queue.isEmpty()) {
-                startQueues.remove(workspaceId);
+                environmentHolder.startQueue = null;
             }
         }
     }
@@ -229,22 +234,23 @@ public class CheEnvironmentEngine implements EnvironmentEngine {
      *
      * @return machine config which is in the queue head, or null
      * if there are no machine configs left
-     * @throws ConflictException
+     * @throws EnvironmentStartException
      *         when queue doesn't exist which means that {@link #stop(String)} executed
      *         before all the machines started
      * @throws ServerException
      *         only if pre destroy has been invoked before peek config retrieved
      */
-    private MachineConfigImpl queuePeekOrFail(String workspaceId) throws ConflictException, ServerException {
+    private MachineConfigImpl queuePeekOrFail(String workspaceId) throws EnvironmentStartException,
+                                                                         ServerException {
         try (StrippedLocks.ReadLock lock = strippedLocks.acquireReadLock(workspaceId)) {
             ensurePreDestroyIsNotExecuted();
-            final Queue<MachineConfigImpl> queue = startQueues.get(workspaceId);
-            if (queue == null) {
-                throw new ConflictException(
+            EnvironmentHolder environmentHolder = environments.get(workspaceId);
+            if (environmentHolder == null || environmentHolder.startQueue == null) {
+                throw new EnvironmentStartException(
                         format("Workspace '%s' start interrupted. Workspace was stopped before all its machines were started",
                                workspaceId));
             }
-            return queue.peek();
+            return environmentHolder.startQueue.peek();
         }
     }
 
@@ -254,17 +260,23 @@ public class CheEnvironmentEngine implements EnvironmentEngine {
     private MachineImpl startMachine(MachineConfigImpl config,
                                      String workspaceId,
                                      String envName,
-                                     boolean recover) throws ServerException,
-                                                             NotFoundException,
-                                                             ConflictException {
-        LineConsumer machineLogger = getMachineLogger(workspaceId, config.getName());
+                                     boolean recover,
+                                     MessageConsumer<MachineLogMessage> messageConsumer) throws ServerException,
+                                                                                                NotFoundException,
+                                                                                                ConflictException {
+        LineConsumer machineLogConsumer = new AbstractLineConsumer() {
+            @Override
+            public void writeLine(String line) throws IOException {
+                messageConsumer.consume(new MachineLogMessageImpl(config.getName(), line));
+            }
+        };
 
         MachineImpl machine;
         try {
             if (recover) {
-                machine = machineManager.recoverMachine(config, workspaceId, envName, machineLogger);
+                machine = machineManager.recoverMachine(config, workspaceId, envName, machineLogConsumer);
             } else {
-                machine = machineManager.createMachineSync(config, workspaceId, envName, machineLogger);
+                machine = machineManager.createMachineSync(config, workspaceId, envName, machineLogConsumer);
             }
         } catch (ConflictException x) {
             // The conflict is because of the already running machine
@@ -337,22 +349,14 @@ public class CheEnvironmentEngine implements EnvironmentEngine {
     @VisibleForTesting
     void cleanupStartResources(String workspaceId) {
         try (StrippedLocks.WriteLock lock = strippedLocks.acquireWriteLock(workspaceId)) {
-            machines.remove(workspaceId);
-            startQueues.remove(workspaceId);
+            descriptors.remove(workspaceId);
         }
     }
 
     @VisibleForTesting
     void removeRuntime(String workspaceId) {
         try (StrippedLocks.WriteLock lock = strippedLocks.acquireWriteLock(workspaceId)) {
-            machines.remove(workspaceId);
-        }
-    }
-
-    @VisibleForTesting
-    void cleanupStartResources(String workspaceId) {
-        try (StrippedLocks.WriteLock lock = strippedLocks.acquireWriteLock(workspaceId)) {
-            descriptors.remove(workspaceId);
+            environments.remove(workspaceId);
         }
     }
 

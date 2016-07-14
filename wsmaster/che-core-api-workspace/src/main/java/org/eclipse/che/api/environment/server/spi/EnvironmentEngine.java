@@ -10,6 +10,7 @@
  *******************************************************************************/
 package org.eclipse.che.api.environment.server.spi;
 
+import org.eclipse.che.api.core.NotFoundException;
 import org.eclipse.che.api.core.ServerException;
 import org.eclipse.che.api.core.model.machine.Machine;
 import org.eclipse.che.api.core.model.machine.MachineLogMessage;
@@ -28,7 +29,9 @@ public interface EnvironmentEngine {
     List<Machine> start(String workspaceId,
                         Environment env,
                         boolean recover,
-                        MessageConsumer<MachineLogMessage> messageConsumer) throws EnvironmentStartException;
+                        MessageConsumer<MachineLogMessage> messageConsumer) throws EnvironmentStartException,
+                                                                                   ServerException;
 
-    void stop(String workspaceId) throws ServerException;
+    void stop(String workspaceId) throws ServerException,
+                                         NotFoundException;
 }
