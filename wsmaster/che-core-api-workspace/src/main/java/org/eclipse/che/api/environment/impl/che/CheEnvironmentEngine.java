@@ -25,6 +25,7 @@ import org.eclipse.che.api.core.model.workspace.Environment;
 import org.eclipse.che.api.core.util.LineConsumer;
 import org.eclipse.che.api.core.util.MessageConsumer;
 import org.eclipse.che.api.core.util.WebsocketMessageConsumer;
+import org.eclipse.che.api.environment.server.EnvironmentStartException;
 import org.eclipse.che.api.environment.server.spi.EnvironmentEngine;
 import org.eclipse.che.api.machine.server.MachineManager;
 import org.eclipse.che.api.machine.server.exception.MachineException;
@@ -91,7 +92,7 @@ public class CheEnvironmentEngine implements EnvironmentEngine {
     public List<Machine> start(String workspaceId,
                                Environment env,
                                boolean recover,
-                               MessageConsumer<MachineLogMessage> messageConsumer) throws ServerException {
+                               MessageConsumer<MachineLogMessage> messageConsumer) throws EnvironmentStartException {
         // Create a new start queue with a dev machine in the queue head
         List<MachineConfigImpl> startConfigs = env.getMachineConfigs()
                                                   .stream()
@@ -106,15 +107,17 @@ public class CheEnvironmentEngine implements EnvironmentEngine {
         environmentHolder.startQueue = new ArrayDeque<>(startConfigs);
         environmentHolder.machines = new ArrayList<>();
 
-        try (StrippedLocks.ReadLock lock = strippedLocks.acquireReadLock(workspaceId)) {
+        try (StrippedLocks.WriteLock lock = strippedLocks.acquireWriteLock(workspaceId)) {
             environments.put(workspaceId, environmentHolder);
         }
 
-        startQueue(workspaceId, envName, recover);
+        startQueue(workspaceId, recover);
 
-        try (StrippedLocks.WriteLock lock = StrippedLocks.WriteLock.acquireLock(workspaceId)) {
-            return toListOfMachines(this.machines.get(workspaceId));
+        List<MachineImpl> machines;
+        try (StrippedLocks.ReadLock lock = strippedLocks.acquireReadLock(workspaceId)) {
+            machines = environments.get(workspaceId).machines;
         }
+        return new ArrayList<>(machines);
     }
 
     @Override
@@ -124,129 +127,22 @@ public class CheEnvironmentEngine implements EnvironmentEngine {
         // In this case workspace start will be interrupted and
         // interruption will be reported, machine which is currently starting(if such exists)
         // will be destroyed by workspace starting thread.
-
-        // At this point of time starting queue must be removed
-        // to prevent start of another machines which are not started yet.
-        // In this case workspace start will be interrupted and
-        // interruption will be reported, machine which is currently starting(if such exists)
-        // will be destroyed by workspace starting thread.
-        startQueues.remove(workspaceId);
-
         List<MachineImpl> machinesCopy = null;
         try (StrippedLocks.WriteLock lock = strippedLocks.acquireWriteLock(workspaceId)) {
-            startQueues.remove(workspaceId);
-            List<MachineImpl> machines = this.machines.get(workspaceId);
+            EnvironmentHolder environmentHolder = environments.get(workspaceId);
+            environmentHolder.startQueue = null;
+            List<MachineImpl> machines = environmentHolder.machines;
             if (machines != null && !machines.isEmpty()) {
                 machinesCopy = new ArrayList<>(machines);
             }
         }
+
         if (machinesCopy != null) {
             destroyRuntime(workspaceId, machinesCopy);
         }
     }
 
-    @VisibleForTesting
-    void cleanupStartResources(String workspaceId) {
-        try (StrippedLocks.WriteLock lock = strippedLocks.acquireWriteLock(workspaceId)) {
-            machines.remove(workspaceId);
-            startQueues.remove(workspaceId);
-        }
-    }
-
-    @VisibleForTesting
-    void removeRuntime(String workspaceId) {
-        try (StrippedLocks.WriteLock lock = strippedLocks.acquireWriteLock(workspaceId)) {
-            machines.remove(workspaceId);
-        }
-    }
-
-    /**
-     * Removes all descriptors from the in-memory storage, while
-     * {@link MachineManager#cleanup()} is responsible for machines destroying.
-     */
-    @PreDestroy
-    @VisibleForTesting
-    void cleanup() {
-        isPreDestroyInvoked = true;
-        final ExecutorService destroyMachinesExecutor =
-                Executors.newFixedThreadPool(2 * Runtime.getRuntime().availableProcessors(),
-                                             new ThreadFactoryBuilder().setNameFormat("DestroyMachine-%d")
-                                                                       .setDaemon(false)
-                                                                       .build());
-        try (StrippedLocks.WriteAllLock lock = strippedLocks.acquireWriteAllLock()) {
-            startQueues.clear();
-
-            try {
-                for (MachineImpl machine : machineManager.getMachines()) {
-                    destroyMachinesExecutor.execute(() -> {
-                        try {
-                            machineManager.destroy(machine.getId(), false);
-                        } catch (NotFoundException ignore) {
-                            // it is ok, machine has been already destroyed
-                        } catch (Exception e) {
-                            LOG.warn(e.getLocalizedMessage());
-                        }
-                    });
-                }
-            } catch (MachineException e) {
-                LOG.error(e.getLocalizedMessage(), e);
-            }
-            destroyMachinesExecutor.shutdown();
-        }
-        try {
-            if (!destroyMachinesExecutor.awaitTermination(50, TimeUnit.SECONDS)) {
-                destroyMachinesExecutor.shutdownNow();
-                if (!destroyMachinesExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
-                    LOG.warn("Unable terminate destroy machines pool");
-                }
-            }
-        } catch (InterruptedException e) {
-            destroyMachinesExecutor.shutdownNow();
-        }
-    }
-
-    private List<Machine> toListOfMachines(List<MachineImpl> machineImpls) {
-        return machineImpls.stream()
-                           .collect(ArrayList::new, List::add, List::addAll);
-    }
-
-    /**
-     * Stops workspace by destroying all its machines and removing it from in memory storage.
-     */
-    private void destroyRuntime(String workspaceId, List<MachineImpl> machines) throws NotFoundException, ServerException {
-        // Preparing the list of machines to be destroyed, dev machine goes last
-        final MachineImpl devMachine = removeFirstMatching(machines, m -> m.getConfig().isDev());
-
-        // Synchronously destroying all non-dev machines
-        for (MachineImpl machine : machines) {
-            try {
-                machineManager.destroy(machine.getId(), false);
-            } catch (NotFoundException ignore) {
-                // This may happen, if machine is stopped by direct call to the Machine API
-                // MachineManager cleanups all the machines due to application server shutdown
-                // As non-dev machines don't affect runtime status, this exception is ignored
-            } catch (RuntimeException | MachineException ex) {
-                LOG.error(format("Could not destroy machine '%s' of workspace '%s'",
-                                 machine.getId(),
-                                 machine.getWorkspaceId()),
-                          ex);
-            }
-        }
-
-        // Synchronously destroying dev-machine
-        try {
-            machineManager.destroy(devMachine.getId(), false);
-        } catch (NotFoundException ignore) {
-            // This may happen, if machine is stopped by direct call to the Machine API
-            // MachineManager cleanups all the machines due to application server shutdown
-            // In this case workspace is considered as successfully stopped
-        } finally {
-            removeRuntime(workspaceId);
-        }
-    }
-
     private void startQueue(String workspaceId,
-                            String envName,
                             boolean recover) throws ServerException,
                                                     NotFoundException,
                                                     ConflictException {
@@ -403,10 +299,105 @@ public class CheEnvironmentEngine implements EnvironmentEngine {
         return machine;
     }
 
+    /**
+     * Stops workspace by destroying all its machines and removing it from in memory storage.
+     */
+    private void destroyRuntime(String workspaceId, List<MachineImpl> machines) throws NotFoundException, ServerException {
+        // Preparing the list of machines to be destroyed, dev machine goes last
+        final MachineImpl devMachine = removeFirstMatching(machines, m -> m.getConfig().isDev());
+
+        // Synchronously destroying all non-dev machines
+        for (MachineImpl machine : machines) {
+            try {
+                machineManager.destroy(machine.getId(), false);
+            } catch (NotFoundException ignore) {
+                // This may happen, if machine is stopped by direct call to the Machine API
+                // MachineManager cleanups all the machines due to application server shutdown
+                // As non-dev machines don't affect runtime status, this exception is ignored
+            } catch (RuntimeException | MachineException ex) {
+                LOG.error(format("Could not destroy machine '%s' of workspace '%s'",
+                                 machine.getId(),
+                                 machine.getWorkspaceId()),
+                          ex);
+            }
+        }
+
+        // Synchronously destroying dev-machine
+        try {
+            machineManager.destroy(devMachine.getId(), false);
+        } catch (NotFoundException ignore) {
+            // This may happen, if machine is stopped by direct call to the Machine API
+            // MachineManager cleanups all the machines due to application server shutdown
+            // In this case workspace is considered as successfully stopped
+        } finally {
+            removeRuntime(workspaceId);
+        }
+    }
+
+    @VisibleForTesting
+    void cleanupStartResources(String workspaceId) {
+        try (StrippedLocks.WriteLock lock = strippedLocks.acquireWriteLock(workspaceId)) {
+            machines.remove(workspaceId);
+            startQueues.remove(workspaceId);
+        }
+    }
+
+    @VisibleForTesting
+    void removeRuntime(String workspaceId) {
+        try (StrippedLocks.WriteLock lock = strippedLocks.acquireWriteLock(workspaceId)) {
+            machines.remove(workspaceId);
+        }
+    }
+
     @VisibleForTesting
     void cleanupStartResources(String workspaceId) {
         try (StrippedLocks.WriteLock lock = strippedLocks.acquireWriteLock(workspaceId)) {
             descriptors.remove(workspaceId);
+        }
+    }
+
+    /**
+     * Removes all descriptors from the in-memory storage, while
+     * {@link MachineManager#cleanup()} is responsible for machines destroying.
+     */
+    @PreDestroy
+    @VisibleForTesting
+    void cleanup() {
+        isPreDestroyInvoked = true;
+        final ExecutorService destroyMachinesExecutor =
+                Executors.newFixedThreadPool(2 * Runtime.getRuntime().availableProcessors(),
+                                             new ThreadFactoryBuilder().setNameFormat("DestroyMachine-%d")
+                                                                       .setDaemon(false)
+                                                                       .build());
+        try (StrippedLocks.WriteAllLock lock = strippedLocks.acquireWriteAllLock()) {
+            startQueues.clear();
+
+            try {
+                for (MachineImpl machine : machineManager.getMachines()) {
+                    destroyMachinesExecutor.execute(() -> {
+                        try {
+                            machineManager.destroy(machine.getId(), false);
+                        } catch (NotFoundException ignore) {
+                            // it is ok, machine has been already destroyed
+                        } catch (Exception e) {
+                            LOG.warn(e.getLocalizedMessage());
+                        }
+                    });
+                }
+            } catch (MachineException e) {
+                LOG.error(e.getLocalizedMessage(), e);
+            }
+            destroyMachinesExecutor.shutdown();
+        }
+        try {
+            if (!destroyMachinesExecutor.awaitTermination(50, TimeUnit.SECONDS)) {
+                destroyMachinesExecutor.shutdownNow();
+                if (!destroyMachinesExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
+                    LOG.warn("Unable terminate destroy machines pool");
+                }
+            }
+        } catch (InterruptedException e) {
+            destroyMachinesExecutor.shutdownNow();
         }
     }
 
@@ -435,7 +426,7 @@ public class CheEnvironmentEngine implements EnvironmentEngine {
 
         public EnvironmentHolder(Queue<MachineConfigImpl> startQueue,
                                  List<MachineImpl> machines,
-                                 WebsocketMessageConsumer<MachineLogMessage> outputConsumer) {
+                                 MessageConsumer<MachineLogMessage> outputConsumer) {
             this.startQueue = startQueue;
             this.machines = machines;
             this.outputConsumer = outputConsumer;

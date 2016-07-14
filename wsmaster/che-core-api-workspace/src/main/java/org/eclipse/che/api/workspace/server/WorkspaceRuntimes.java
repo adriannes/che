@@ -24,7 +24,9 @@ import org.eclipse.che.api.core.model.workspace.WorkspaceStatus;
 import org.eclipse.che.api.core.notification.EventService;
 import org.eclipse.che.api.core.notification.EventSubscriber;
 import org.eclipse.che.api.core.util.AbstractLineConsumer;
+import org.eclipse.che.api.core.util.AbstractMessageConsumer;
 import org.eclipse.che.api.core.util.LineConsumer;
+import org.eclipse.che.api.core.util.MessageConsumer;
 import org.eclipse.che.api.core.util.WebsocketMessageConsumer;
 import org.eclipse.che.api.environment.server.EnvironmentStartException;
 import org.eclipse.che.api.environment.server.spi.EnvironmentEngine;
@@ -151,7 +153,7 @@ public class WorkspaceRuntimes {
      * @throws ServerException
      *         when component {@link #isPreDestroyInvoked is stopped} or any
      *         other error occurs during environment start
-     * @see EnvironmentEngine#start(String, Environment, boolean)
+     * @see EnvironmentEngine#start(String, Environment, boolean, MessageConsumer)
      * @see WorkspaceStatus#STARTING
      * @see WorkspaceStatus#RUNNING
      */
@@ -204,7 +206,10 @@ public class WorkspaceRuntimes {
 
         String environmentStartError;
         try {
-            List<Machine> machines = engine.start(workspaceId, environmentCopy, recover);
+            List<Machine> machines = engine.start(workspaceId,
+                                                  environmentCopy,
+                                                  recover,
+                                                  getEnvironmentLogger(workspaceId));
 
             List<MachineImpl> machinesImpls = machines.stream()
                                                       .map(MachineImpl::new)
@@ -357,6 +362,18 @@ public class WorkspaceRuntimes {
         }
     }
 
+    public MessageConsumer<MachineLogMessage> getEnvironmentLogger(String workspaceId) throws ServerException {
+        WebsocketMessageConsumer<MachineLogMessage> envMessageConsumer =
+                new WebsocketMessageConsumer<>(format(ENVIRONMENT_OUTPUT_CHANNEL_TEMPLATE, workspaceId));
+        return new AbstractMessageConsumer<MachineLogMessage>() {
+            @Override
+            public void consume(MachineLogMessage message) throws IOException {
+                envMessageConsumer.consume(message);
+            }
+        };
+    }
+
+    // todo find usage ; is it needed?
     public LineConsumer getMachineLogger(String workspaceId, String machineName) throws ServerException {
         WebsocketMessageConsumer<MachineLogMessage> envMessageConsumer =
                 new WebsocketMessageConsumer<>(format(ENVIRONMENT_OUTPUT_CHANNEL_TEMPLATE, workspaceId));
@@ -477,6 +494,7 @@ public class WorkspaceRuntimes {
         }
     }
 
+    // todo consider usage of listener added to engines. That listener can react on unpredictable stop of machines
     @VisibleForTesting
     class RemoveMachineEventSubscriber implements EventSubscriber<MachineStatusEvent> {
 

@@ -12,7 +12,9 @@ package org.eclipse.che.api.environment.server.spi;
 
 import org.eclipse.che.api.core.ServerException;
 import org.eclipse.che.api.core.model.machine.Machine;
+import org.eclipse.che.api.core.model.machine.MachineLogMessage;
 import org.eclipse.che.api.core.model.workspace.Environment;
+import org.eclipse.che.api.core.util.MessageConsumer;
 import org.eclipse.che.api.environment.server.EnvironmentStartException;
 
 import java.util.List;
@@ -23,7 +25,10 @@ import java.util.List;
 public interface EnvironmentEngine {
     String getType();
 
-    List<Machine> start(String workspaceId, Environment env, boolean recover) throws EnvironmentStartException;
+    List<Machine> start(String workspaceId,
+                        Environment env,
+                        boolean recover,
+                        MessageConsumer<MachineLogMessage> messageConsumer) throws EnvironmentStartException;
 
     void stop(String workspaceId) throws ServerException;
 }
