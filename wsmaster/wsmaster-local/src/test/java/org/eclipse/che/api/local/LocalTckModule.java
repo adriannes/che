@@ -19,14 +19,17 @@ import org.eclipse.che.api.machine.server.recipe.RecipeImpl;
 import org.eclipse.che.api.machine.server.spi.RecipeDao;
 import org.eclipse.che.api.user.server.model.impl.ProfileImpl;
 import org.eclipse.che.api.user.server.model.impl.UserImpl;
+import org.eclipse.che.api.user.server.spi.PreferenceDao;
 import org.eclipse.che.api.user.server.spi.ProfileDao;
 import org.eclipse.che.api.user.server.spi.UserDao;
+import org.eclipse.che.commons.lang.Pair;
 import org.eclipse.che.commons.test.tck.TckModule;
 import org.eclipse.che.commons.test.tck.repository.TckRepository;
 
 import javax.inject.Singleton;
 import java.io.IOException;
 import java.util.Collections;
+import java.util.Map;
 import java.util.Set;
 
 import static java.util.Collections.emptySet;
@@ -57,9 +60,12 @@ public class LocalTckModule extends TckModule {
         bind(new TypeLiteral<TckRepository<UserImpl>>() {}).to(LocalUserTckRepository.class).in(Singleton.class);
         bind(new TypeLiteral<TckRepository<ProfileImpl>>() {}).to(LocalProfileTckRepository.class).in(Singleton.class);
         bind(new TypeLiteral<TckRepository<RecipeImpl>>() {}).to(LocalRecipeTckRepository.class).in(Singleton.class);
+        bind(new TypeLiteral<TckRepository<Pair<String, Map<String, String>>>>() {}).to(LocalPreferenceTckRepository.class)
+                                                                                    .in(Singleton.class);
 
         bind(UserDao.class).to(LocalUserDaoImpl.class).in(Singleton.class);
         bind(ProfileDao.class).to(LocalProfileDaoImpl.class).in(Singleton.class);
         bind(RecipeDao.class).to(LocalRecipeDaoImpl.class).in(Singleton.class);
+        bind(PreferenceDao.class).to(LocalPreferenceDaoImpl.class).in(Singleton.class);
     }
 }
