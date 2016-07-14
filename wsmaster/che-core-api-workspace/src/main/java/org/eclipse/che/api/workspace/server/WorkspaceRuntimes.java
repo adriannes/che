@@ -417,7 +417,7 @@ public class WorkspaceRuntimes {
                                                                   .getRuntime()
                                                                   .getEnvType())
                                               .stop(descriptorEntry.getKey());
-                        } catch (ServerException e) {
+                        } catch (ServerException | NotFoundException e) {
                             LOG.error(e.getLocalizedMessage(), e);
                         }
                     });
